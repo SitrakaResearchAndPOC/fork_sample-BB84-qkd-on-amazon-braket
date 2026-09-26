@@ -1,393 +1,112 @@
+import base64
 import numpy as np
-from itertools import combinations
 
+from braket.circuits import noises
+from braket.devices import LocalSimulator
 
-class GolayCode:
-    """
-    Code binaire de Golay étendu [24, 12, 8].
+from utils.bb84 import initialize_protocol, encode_qubits, measure_qubits, filter_qubits, array_to_string
+from utils.golay_code import GolayCode
+from utils.secret_utils import convert_to_octets
 
-    k = 12 : nombre de bits d'information
-    n = 24 : longueur du mot de code
-    d = 8   : distance minimale
-    t = 3   : nombre maximal d'erreurs corrigibles
-    """
+# ---
 
-    def __init__(self):
+BIT_FLIP_PROBABILITY = 0.1          # probability of bit flip - should work fine up to probability of about 0.25
+NUMBER_OF_QUBITS = 12               # only change this line if you are sure you know what you're doing :)
+ERROR_CORRECTION_CHUNK_SIZE = 12    # do not change this line in this notebook
 
-        self.k = 12
-        self.n = 24
-        self.d = 8
-        self.t = 3
+alice_raw_key = np.array([])
+bob_raw_key = np.array([])
 
-        # Matrices
-        self.b_mat = []
-        self.generator_mat = []
-        self.parity_check = []
+# ---
 
-        # Table :
-        # syndrome de 12 bits -> vecteur d'erreur de 24 bits
-        self.syndrome_table = None
+# Generate key material until there are 12 bits of raw key
 
-    # ============================================================
-    # MATRICE B
-    # ============================================================
+while len(alice_raw_key) < ERROR_CORRECTION_CHUNK_SIZE:
 
-    def b_matrix(self):
+    # For Alice, the important basis is encoding basis.
+    encoding_basis_A, states_A, _ = initialize_protocol(NUMBER_OF_QUBITS)
+    
+    # Print the initial state of Alice
+    sent_bits = array_to_string(states_A)
 
-        self.b_mat = np.array([
-            [1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1],
-            [1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1],
-            [0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1],
-            [1, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1],
-            [1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1],
-            [1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 1],
-            [0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1],
-            [0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1],
-            [0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 1],
-            [1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1],
-            [0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1],
-            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
-        ], dtype=int)
+    # For Bob, the relevant basis is measurement basis.
+    _, _, measurement_basis_B = initialize_protocol(NUMBER_OF_QUBITS)
 
-        return self.b_mat
+    # Alice encodes the values of her qubits using according bases from `encoding_bases_A`.  
+    # This is stored as a Qiskit quantum circuit.  
+    encoded_qubits_A = encode_qubits(NUMBER_OF_QUBITS, states_A, encoding_basis_A)
 
-    # ============================================================
-    # MATRICE GENERATRICE G
-    # ============================================================
+    # Transmission of encoded qubits to Bob - might add noise!
+    noise = noises.BitFlip(probability=BIT_FLIP_PROBABILITY)
+    encoded_qubits_A.apply_gate_noise(noise)
 
-    def generator_matrix(self):
+    # Bob performs measurement on the received qubits
+    measured_circuit = measure_qubits(encoded_qubits_A, measurement_basis_B)
+    device = LocalSimulator("braket_dm")
+    result = device.run(measured_circuit, shots=1).result()
+    measured_bits = list(result.measurements[0])
 
-        B = self.b_matrix()
+    # After Bob has measured the qubits, he sends his measurement bases to Alice. 
+    # She responds to Bob by sending him her encoding bases. Now both parties know both the encoding basis and measurement basis for each qubit.   
+    # In the key sifting phase, both sides keep only the qubits for which encoding basis and measurement basis were the same.      
+    alice_raw_key = np.concatenate( (alice_raw_key, filter_qubits(sent_bits, encoding_basis_A, measurement_basis_B)) ) 
+    bob_raw_key = np.concatenate( (bob_raw_key, filter_qubits(measured_bits, encoding_basis_A, measurement_basis_B)) )
 
-        self.generator_mat = np.zeros(
-            (self.n, self.k),
-            dtype=int
-        )
 
-        # G = [ I ]
-        #     [ B ]
-        self.generator_mat[:self.k, :] = np.eye(
-            self.k,
-            dtype=int
-        )
+# ---
 
-        self.generator_mat[self.k:, :] = B
+alice_raw_key = alice_raw_key[:12]
+alice_raw_key
 
-        return self.generator_mat
+# ---
 
-    # ============================================================
-    # MATRICE DE CONTROLE H
-    # ============================================================
+bob_raw_key = bob_raw_key[:12]
+bob_raw_key
 
-    def parity_check_matrix(self):
+# ---
 
-        B = self.b_matrix()
+error_correcting_code = GolayCode()
 
-        self.parity_check = np.zeros(
-            (self.n, self.k),
-            dtype=int
-        )
+generator_matrix = error_correcting_code.get_generator_matrix()
+parity_check = error_correcting_code.get_parity_check_matrix()
+b_matrix = error_correcting_code.get_b_matrix()
 
-        # H = [ B ]
-        #     [ I ]
-        self.parity_check[:self.k, :] = B
+# ---
 
-        self.parity_check[self.k:, :] = np.eye(
-            self.k,
-            dtype=int
-        )
+encoded_key_A = np.matmul(generator_matrix, alice_raw_key) % 2
+print(f'Key of Alice after encoding is: {encoded_key_A}')
+syndrome_A = np.matmul(encoded_key_A, parity_check) % 2
+print(f'Syndrom of Alice (should be all zero): {syndrome_A}')
+parity_bits = encoded_key_A[12:]
+print(f'Information sent to Bob: {parity_bits}')
 
-        return self.parity_check
+# ---
 
-    # ============================================================
-    # GETTERS
-    # ============================================================
+encoded_key_B = np.concatenate((bob_raw_key, parity_bits))
+print(encoded_key_B)
+syndrome_B = np.matmul(encoded_key_B, parity_check) % 2
+print(syndrome_B)
+syndrome_BB = np.matmul(syndrome_B, b_matrix) % 2
+syndrome_BB
 
-    def get_generator_matrix(self):
+# ---
 
-        if len(self.generator_mat) == 0:
-            self.generator_mat = self.generator_matrix()
+if syndrome_BB.sum() < 4:
+    correction_mask = np.concatenate((syndrome_BB, np.zeros(12,)))
+    print(correction_mask)
+else:
+    print("Decoding failed - more than 3 errors")
 
-        return self.generator_mat
+# ---
 
-    def get_parity_check_matrix(self):
+corrected_key = np.mod(bob_raw_key + correction_mask[:12], 2).astype(int)
+corrected_key
 
-        if len(self.parity_check) == 0:
-            self.parity_check = self.parity_check_matrix()
+# ---
 
-        return self.parity_check
+corrected_key == alice_raw_key
 
-    def get_b_matrix(self):
+# ---
 
-        if len(self.b_mat) == 0:
-            self.b_mat = self.b_matrix()
-
-        return self.b_mat
-
-    # ============================================================
-    # VERIFICATION DES MATRICES
-    # ============================================================
-
-    def verify_code(self):
-
-        G = self.get_generator_matrix()
-        H = self.get_parity_check_matrix()
-
-        # G^T H = 0 mod 2
-        orthogonality = (
-            np.matmul(G.T, H) % 2
-        )
-
-        orthogonal = np.all(
-            orthogonality == 0
-        )
-
-        return orthogonal
-
-    # ============================================================
-    # ENCODAGE
-    # ============================================================
-
-    def encode(self, message):
-
-        message = np.asarray(
-            message,
-            dtype=int
-        )
-
-        if len(message) != self.k:
-            raise ValueError(
-                f"Le message doit contenir "
-                f"{self.k} bits."
-            )
-
-        G = self.get_generator_matrix()
-
-        codeword = (
-            np.matmul(G, message) % 2
-        )
-
-        return codeword.astype(int)
-
-    # ============================================================
-    # CALCUL DU SYNDROME
-    # ============================================================
-
-    def syndrome(self, received):
-
-        received = np.asarray(
-            received,
-            dtype=int
-        )
-
-        if len(received) != self.n:
-            raise ValueError(
-                f"Le mot reçu doit contenir "
-                f"{self.n} bits."
-            )
-
-        H = self.get_parity_check_matrix()
-
-        syndrome = (
-            np.matmul(received, H) % 2
-        )
-
-        return syndrome.astype(int)
-
-    # ============================================================
-    # CONVERSION SYNDROME -> CHAINE
-    # ============================================================
-
-    @staticmethod
-    def syndrome_to_string(syndrome):
-
-        return "".join(
-            str(int(bit))
-            for bit in syndrome
-        )
-
-    # ============================================================
-    # CONSTRUCTION DE LA TABLE DE DECODAGE
-    # ============================================================
-
-    def build_syndrome_table(self):
-
-        # Si déjà construite, on la réutilise
-        if self.syndrome_table is not None:
-            return self.syndrome_table
-
-        H = self.get_parity_check_matrix()
-
-        table = {}
-
-        # --------------------------------------------------------
-        # ERREUR DE POIDS 0
-        # --------------------------------------------------------
-
-        error = np.zeros(
-            self.n,
-            dtype=int
-        )
-
-        syndrome = (
-            np.matmul(error, H) % 2
-        )
-
-        key = tuple(
-            syndrome.tolist()
-        )
-
-        table[key] = error.copy()
-
-        # --------------------------------------------------------
-        # ERREURS DE POIDS 1, 2 ET 3
-        # --------------------------------------------------------
-
-        for weight in range(
-            1,
-            self.t + 1
-        ):
-
-            for positions in combinations(
-                range(self.n),
-                weight
-            ):
-
-                error = np.zeros(
-                    self.n,
-                    dtype=int
-                )
-
-                error[list(positions)] = 1
-
-                syndrome = (
-                    np.matmul(
-                        error,
-                        H
-                    ) % 2
-                )
-
-                key = tuple(
-                    syndrome.tolist()
-                )
-
-                # Pour un code [24,12,8], deux erreurs
-                # distinctes de poids <= 3 ne doivent pas
-                # avoir le même syndrome.
-
-                if key in table:
-
-                    raise ValueError(
-                        "Collision dans la table des "
-                        "syndromes.\n"
-                        f"Poids de l'erreur : {weight}\n"
-                        f"Syndrome : {key}"
-                    )
-
-                table[key] = error.copy()
-
-        self.syndrome_table = table
-
-        return self.syndrome_table
-
-    # ============================================================
-    # DECODAGE
-    # ============================================================
-
-    def decode(self, received):
-
-        received = np.asarray(
-            received,
-            dtype=int
-        )
-
-        if len(received) != self.n:
-            raise ValueError(
-                f"Le mot reçu doit contenir "
-                f"{self.n} bits."
-            )
-
-        # --------------------------------------------------------
-        # Syndrome
-        # --------------------------------------------------------
-
-        syndrome = self.syndrome(
-            received
-        )
-
-        syndrome_key = tuple(
-            syndrome.tolist()
-        )
-
-        # --------------------------------------------------------
-        # Table
-        # --------------------------------------------------------
-
-        table = self.build_syndrome_table()
-
-        # --------------------------------------------------------
-        # Syndrome non présent
-        #
-        # Cela signifie que le motif d'erreur n'est pas
-        # représenté parmi les erreurs de poids 0 à 3.
-        # --------------------------------------------------------
-
-        if syndrome_key not in table:
-
-            return {
-                "success": False,
-                "received": received.copy(),
-                "corrected": None,
-                "error_pattern": None,
-                "error_weight": None,
-                "syndrome": syndrome.copy()
-            }
-
-        # --------------------------------------------------------
-        # Motif d'erreur
-        # --------------------------------------------------------
-
-        error_pattern = table[
-            syndrome_key
-        ].copy()
-
-        error_weight = int(
-            np.sum(error_pattern)
-        )
-
-        # --------------------------------------------------------
-        # Correction
-        # --------------------------------------------------------
-
-        corrected = np.mod(
-            received + error_pattern,
-            2
-        ).astype(int)
-
-        # --------------------------------------------------------
-        # Vérification du mot corrigé
-        # --------------------------------------------------------
-
-        corrected_syndrome = (
-            self.syndrome(corrected)
-        )
-
-        correction_valid = np.all(
-            corrected_syndrome == 0
-        )
-
-        if not correction_valid:
-
-            raise RuntimeError(
-                "Le mot corrigé possède encore "
-                "un syndrome non nul."
-            )
-
-        return {
-            "success": True,
-            "received": received.copy(),
-            "corrected": corrected,
-            "error_pattern": error_pattern,
-            "error_weight": error_weight,
-            "syndrome": syndrome.copy()
-        }
+ASCII_key = base64.b64encode(convert_to_octets(array_to_string(corrected_key))).decode('ascii')
+print(ASCII_key)
